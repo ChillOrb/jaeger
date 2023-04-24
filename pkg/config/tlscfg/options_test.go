@@ -18,8 +18,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net/http"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -185,4 +190,108 @@ func TestOptionsToConfig(t *testing.T) {
 			assert.NoError(t, test.options.Close())
 		})
 	}
+}
+
+func TestOptionsToConfigRaceCondition(t *testing.T) {
+
+	options := Options{
+		CAPath:   testCertKeyLocation + "/example-CA-cert.pem",
+		CertPath: testCertKeyLocation + "/example-client-cert.pem",
+		KeyPath:  testCertKeyLocation + "/example-client-key.pem",
+	}
+
+	cfg, err := options.Config(zap.NewNop())
+	require.NoError(t, err)
+	assert.NotNil(t, cfg)
+
+	if options.CertPath != "" && options.KeyPath != "" {
+		c, e := tls.LoadX509KeyPair(filepath.Clean(options.CertPath), filepath.Clean(options.KeyPath))
+		require.NoError(t, e)
+		cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{})
+		cert, err = cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
+		require.NoError(t, err)
+		assert.Equal(t, &c, cert)
+	}
+
+	server := &http.Server{
+		Addr:      ":8443",
+		TLSConfig: cfg,
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			writer.WriteHeader(http.StatusOK)
+		}),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		err := server.ListenAndServeTLS("", "")
+		fmt.Println(err)
+	}()
+
+	// 3. In one goroutine, periodically generate new certificates and reload them for the server.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for i := 0; i < 5; i++ {
+			time.Sleep(2 * time.Second)
+			output, err := exec.Command("bash", testCertKeyLocation+"gen-certs.sh").Output()
+
+			if err != nil {
+				fmt.Printf("Error executing script: %v\n", err)
+				return
+			}
+			result := strings.TrimSpace(string(output))
+			fmt.Println(result)
+			options := Options{
+				CAPath:   testCertKeyLocation + "/example-CA-cert.pem",
+				CertPath: testCertKeyLocation + "/example-client-cert.pem",
+				KeyPath:  testCertKeyLocation + "/example-client-key.pem",
+			}
+			c, err := tls.LoadX509KeyPair(filepath.Clean(options.CertPath), filepath.Clean(options.KeyPath))
+			if err != nil {
+				fmt.Printf("Error generating new cert: %v", err)
+				return
+			}
+			cfg.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				return &c, nil
+			}
+		}
+	}()
+
+	// 4. In another goroutine, make GET calls to the server in a loop.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		client := http.Client{
+			Timeout: 1 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+			},
+		}
+
+		for i := 0; i < 10; i++ {
+			time.Sleep(1 * time.Second)
+
+			resp, err := client.Get("https://localhost:8443")
+			if err != nil {
+				fmt.Printf("Error making GET request: %v", err)
+				return
+			}
+			defer resp.Body.Close()
+
+			fmt.Printf("GET request succeeded with status: %d", resp.StatusCode)
+		}
+	}()
+
+	time.Sleep(5 * time.Second)
+	server.Close()
+
+	wg.Wait()
+
 }
