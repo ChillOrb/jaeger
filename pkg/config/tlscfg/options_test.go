@@ -15,9 +15,11 @@
 package tlscfg
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -193,8 +195,9 @@ func TestOptionsToConfig(t *testing.T) {
 }
 
 func TestOptionsToConfigRaceCondition(t *testing.T) {
-
-	options := Options{
+	var cfg *tls.Config
+	var mu sync.Mutex
+	options := &Options{
 		CAPath:   testCertKeyLocation + "/example-CA-cert.pem",
 		CertPath: testCertKeyLocation + "/example-client-cert.pem",
 		KeyPath:  testCertKeyLocation + "/example-client-key.pem",
@@ -214,84 +217,100 @@ func TestOptionsToConfigRaceCondition(t *testing.T) {
 	}
 
 	server := &http.Server{
-		Addr:      ":8443",
-		TLSConfig: cfg,
-		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			writer.WriteHeader(http.StatusOK)
-		}),
+		Addr:         ":8443",
+		TLSConfig:    cfg,
+		Handler:      http.HandlerFunc(helloHandler),
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)), // Disable HTTP/2
+
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	var wgServe sync.WaitGroup
+	wgServe.Add(1)
+	go func(wgServe *sync.WaitGroup) {
+		defer wgServe.Done()
+		if err := server.ListenAndServeTLS("", ""); err != nil {
+			fmt.Println(err)
+		}
 
-	go func() {
+	}(&wgServe)
+
+	//In one goroutine, periodically generate new certificates and reload them for the server.
+	var wgTls sync.WaitGroup
+	wgTls.Add(1)
+	go func(wg *sync.WaitGroup) {
 		defer wg.Done()
-		err := server.ListenAndServeTLS("", "")
-		fmt.Println(err)
-	}()
-
-	// 3. In one goroutine, periodically generate new certificates and reload them for the server.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		for i := 0; i < 5; i++ {
-			time.Sleep(2 * time.Second)
-			output, err := exec.Command("bash", testCertKeyLocation+"gen-certs.sh").Output()
-
+		for i := 0; i < 10; i++ {
+			output, err := exec.Command("/bin/sh", testCertKeyLocation+"/gen-certs.sh").CombinedOutput()
 			if err != nil {
 				fmt.Printf("Error executing script: %v\n", err)
 				return
 			}
 			result := strings.TrimSpace(string(output))
 			fmt.Println(result)
-			options := Options{
+			options := &Options{
 				CAPath:   testCertKeyLocation + "/example-CA-cert.pem",
 				CertPath: testCertKeyLocation + "/example-client-cert.pem",
 				KeyPath:  testCertKeyLocation + "/example-client-key.pem",
 			}
-			c, err := tls.LoadX509KeyPair(filepath.Clean(options.CertPath), filepath.Clean(options.KeyPath))
-			if err != nil {
-				fmt.Printf("Error generating new cert: %v", err)
-				return
+			cfg, err = options.Config(zap.NewNop())
+
+			require.NoError(t, err)
+			assert.NotNil(t, cfg)
+			if options.CertPath != "" && options.KeyPath != "" {
+				c, e := tls.LoadX509KeyPair(filepath.Clean(options.CertPath), filepath.Clean(options.KeyPath))
+				require.NoError(t, e)
+				cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{})
+				cert, err = cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
+				require.NoError(t, err)
+				assert.Equal(t, &c, cert)
 			}
-			cfg.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-				return &c, nil
-			}
-		}
-	}()
-
-	// 4. In another goroutine, make GET calls to the server in a loop.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		client := http.Client{
-			Timeout: 1 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
-			},
-		}
-
-		for i := 0; i < 10; i++ {
+			//reload server
+			mu.Lock()
+			server.TLSConfig = cfg
 			time.Sleep(1 * time.Second)
+			mu.Unlock()
 
-			resp, err := client.Get("https://localhost:8443")
-			if err != nil {
-				fmt.Printf("Error making GET request: %v", err)
-				return
+		}
+	}(&wgTls)
+
+	var wgGet sync.WaitGroup
+
+	go func() {
+		for i := 0; i < 100; i++ {
+			cfg.InsecureSkipVerify = true
+			client := &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: cfg,
+				},
 			}
-			defer resp.Body.Close()
+			wgGet.Add(1)
+			go func(i int) {
+				defer wgGet.Done()
+				resp, err := client.Get("https://localhost:8443")
+				if err != nil {
+					fmt.Printf("Error making GET request: %v", err)
+					return
+				}
+				defer resp.Body.Close()
 
-			fmt.Printf("GET request succeeded with status: %d", resp.StatusCode)
+				fmt.Printf("GET request succeeded with status: %d\n", resp.StatusCode)
+				rand.Seed(time.Now().UnixNano())
+				randomDuration := time.Duration(500+rand.Intn(5000)) * time.Millisecond
+				time.Sleep(randomDuration)
+			}(i)
 		}
 	}()
 
-	time.Sleep(5 * time.Second)
-	server.Close()
+	wgTls.Wait()
+	wgGet.Wait()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		fmt.Println("Error shutting down the server:", err)
+	}
+	fmt.Println("Server shut down gracefully")
+}
 
-	wg.Wait()
-
+func helloHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "test server")
 }
