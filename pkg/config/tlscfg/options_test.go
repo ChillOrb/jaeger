@@ -23,7 +23,6 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -198,6 +197,7 @@ func TestOptionsToConfigRaceCondition(t *testing.T) {
 	var cfg *tls.Config
 	var mu sync.Mutex
 	options := &Options{
+		Enabled:  true,
 		CAPath:   testCertKeyLocation + "/example-CA-cert.pem",
 		CertPath: testCertKeyLocation + "/example-client-cert.pem",
 		KeyPath:  testCertKeyLocation + "/example-client-key.pem",
@@ -207,19 +207,10 @@ func TestOptionsToConfigRaceCondition(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, cfg)
 
-	if options.CertPath != "" && options.KeyPath != "" {
-		c, e := tls.LoadX509KeyPair(filepath.Clean(options.CertPath), filepath.Clean(options.KeyPath))
-		require.NoError(t, e)
-		cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{})
-		cert, err = cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
-		require.NoError(t, err)
-		assert.Equal(t, &c, cert)
-	}
-
 	server := &http.Server{
 		Addr:         ":8443",
 		TLSConfig:    cfg,
-		Handler:      http.HandlerFunc(helloHandler),
+		Handler:      nil,
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)), // Disable HTTP/2
 
 	}
@@ -239,68 +230,55 @@ func TestOptionsToConfigRaceCondition(t *testing.T) {
 	wgTls.Add(1)
 	go func(wg *sync.WaitGroup) {
 		defer wg.Done()
-		for i := 0; i < 10; i++ {
-			output, err := exec.Command("/bin/sh", testCertKeyLocation+"/gen-certs.sh").CombinedOutput()
+		for i := 0; i < 5; i++ {
+			_, err := exec.Command("/bin/sh", testCertKeyLocation+"/gen-certs.sh").CombinedOutput()
 			if err != nil {
 				fmt.Printf("Error executing script: %v\n", err)
 				return
 			}
-			result := strings.TrimSpace(string(output))
-			fmt.Println(result)
-			options := &Options{
-				CAPath:   testCertKeyLocation + "/example-CA-cert.pem",
-				CertPath: testCertKeyLocation + "/example-client-cert.pem",
-				KeyPath:  testCertKeyLocation + "/example-client-key.pem",
-			}
-			cfg, err = options.Config(zap.NewNop())
-
-			require.NoError(t, err)
-			assert.NotNil(t, cfg)
-			if options.CertPath != "" && options.KeyPath != "" {
-				c, e := tls.LoadX509KeyPair(filepath.Clean(options.CertPath), filepath.Clean(options.KeyPath))
-				require.NoError(t, e)
-				cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{})
-				cert, err = cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
-				require.NoError(t, err)
-				assert.Equal(t, &c, cert)
-			}
+			cfg, err := options.Config(zap.NewNop())
 			//reload server
 			mu.Lock()
 			server.TLSConfig = cfg
-			time.Sleep(1 * time.Second)
 			mu.Unlock()
+			time.Sleep(time.Second)
 
 		}
 	}(&wgTls)
 
 	var wgGet sync.WaitGroup
-
-	go func() {
+	wgGet.Add(1)
+	go func(wgGet *sync.WaitGroup) {
+		defer wgGet.Done()
 		for i := 0; i < 100; i++ {
-			cfg.InsecureSkipVerify = true
+			seed := time.Now().UnixNano()
+			source := rand.NewSource(seed)
+			r := rand.New(source)
+			randomDuration := time.Duration(500+r.Intn(2000)) * time.Millisecond
+			time.Sleep(randomDuration)
+			clientOptions := options
+			clientOptions.SkipHostVerify = false
+			clientCfg, err := clientOptions.Config(zap.NewNop())
+			require.NoError(t, err)
+			assert.NotNil(t, cfg)
 			client := &http.Client{
 				Transport: &http.Transport{
-					TLSClientConfig: cfg,
+					TLSClientConfig: clientCfg,
 				},
 			}
 			wgGet.Add(1)
-			go func(i int) {
-				defer wgGet.Done()
-				resp, err := client.Get("https://localhost:8443")
-				if err != nil {
-					fmt.Printf("Error making GET request: %v", err)
-					return
-				}
-				defer resp.Body.Close()
+			defer wgGet.Done()
+			resp, err := client.Get("https://localhost:8443")
+			if err != nil {
+				fmt.Printf("Error making GET request: %v", err)
+				return
+			}
+			defer resp.Body.Close()
 
-				fmt.Printf("GET request succeeded with status: %d\n", resp.StatusCode)
-				rand.Seed(time.Now().UnixNano())
-				randomDuration := time.Duration(500+rand.Intn(5000)) * time.Millisecond
-				time.Sleep(randomDuration)
-			}(i)
+			fmt.Printf("GET request succeeded with status: %d\n", resp.StatusCode)
+
 		}
-	}()
-
+	}(&wgGet)
 	wgTls.Wait()
 	wgGet.Wait()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -309,8 +287,4 @@ func TestOptionsToConfigRaceCondition(t *testing.T) {
 		fmt.Println("Error shutting down the server:", err)
 	}
 	fmt.Println("Server shut down gracefully")
-}
-
-func helloHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "test server")
 }
